@@ -45,14 +45,12 @@
 	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
 	 */
 	"ai": {
-		"binding": "AI",
-        "remote": true
+		"binding": "AI"
 	},
     "dispatch_namespaces": [
         {
             "binding": "DISPATCHER",
-            "namespace": "vibesdk-default-namespace",
-            "remote": true
+            "namespace": "vibesdk-default-namespace"
         }
     ],
 	"containers": [
@@ -76,8 +74,7 @@
 			"binding": "DB",
 			"database_name": "vibesdk-db",
 			"database_id": "a01dc9fb-02a7-4025-b3aa-765953fe0aa8",
-			"migrations_dir": "migrations",
-			"remote": true
+			"migrations_dir": "migrations"
 		}
 	],
 	"durable_objects": {
@@ -104,14 +101,13 @@
       {
         "binding": "TEMPLATES_BUCKET",
         "bucket_name": "vibesdk-templates",
-        "remote": true,"preview_bucket_name": "vibesdk-templates"
+        "preview_bucket_name": "vibesdk-templates"
       }
     ],
     "kv_namespaces": [
         {
             "binding": "VibecoderStore",
-            "id": "3a39e9ee15fd4f3e8710d24b674d4f4b",
-            "remote": true
+            "id": "3a39e9ee15fd4f3e8710d24b674d4f4b"
         }
     ],
     // "placement": {
@@ -140,13 +136,13 @@
 	],
 	"routes": [
         {
-            "pattern": "build.cloudflare.dev",
+            "pattern": "app.prokit.uk",
             "custom_domain": true
         },
         {
-            "pattern": "*build-preview.cloudflare.dev/*",
+            "pattern": "*build-preview.prokit.uk/*",
             "custom_domain": false,
-            "zone_id": "db01fac4261b2604aacad8410443a3e2"
+            "zone_id": "befc8127a4b6944fb8236d7b23b62d47"
         }
     ],
 	"vars": {
