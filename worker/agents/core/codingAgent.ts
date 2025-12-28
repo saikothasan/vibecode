@@ -84,9 +84,13 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
 
     constructor(ctx: AgentContext, env: Env) {
         super(ctx, env);
-                
-        void this.sql`CREATE TABLE IF NOT EXISTS full_conversations (id TEXT PRIMARY KEY, messages TEXT)`;
-        void this.sql`CREATE TABLE IF NOT EXISTS compact_conversations (id TEXT PRIMARY KEY, messages TEXT)`;
+        
+        try {
+            void this.sql`CREATE TABLE IF NOT EXISTS full_conversations (id TEXT PRIMARY KEY, messages TEXT)`;
+            void this.sql`CREATE TABLE IF NOT EXISTS compact_conversations (id TEXT PRIMARY KEY, messages TEXT)`;
+        } catch (e) {
+            console.error("Failed to initialize SQLite tables", e);
+        }
 
         // Create StateManager
         const stateManager = new StateManager(
@@ -126,16 +130,21 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
         const sandboxSessionId = DeploymentManager.generateNewSessionId();
         this.initLogger(inferenceContext.metadata.agentId, inferenceContext.metadata.userId, sandboxSessionId);
 
-        // Infrastructure setup
-        await this.gitInit();
-        
-        // Let behavior handle all state initialization (blueprint, projectName, etc.)
-        await this.behavior.initialize({
-            ...initArgs,
-            sandboxSessionId // Pass generated session ID to behavior
-        });
-        
-        await this.saveToDatabase();
+        try {
+            // Infrastructure setup
+            await this.gitInit();
+            
+            // Let behavior handle all state initialization (blueprint, projectName, etc.)
+            await this.behavior.initialize({
+                ...initArgs,
+                sandboxSessionId // Pass generated session ID to behavior
+            });
+            
+            await this.saveToDatabase();
+        } catch (error) {
+            this.logger().error("Agent initialization failed", error);
+            throw error;
+        }
         
         return this.state;
     }
@@ -149,65 +158,74 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
      * @param props - Optional props
      */
     async onStart(props?: Record<string, unknown> | undefined): Promise<void> {
-        // Run common migration FIRST, before any state access
-        const migratedState = StateMigration.migrateCommon(this.state);
-        if (migratedState) {
-            this.setState(migratedState);
+        try {
+            // Run common migration FIRST, before any state access
+            const migratedState = StateMigration.migrateCommon(this.state);
+            if (migratedState) {
+                this.setState(migratedState);
+            }
+
+            this.logger().info(`Agent ${this.getAgentId()} session: ${this.state.sessionId} onStart`, { props });
+
+            this.logger().info('Bootstrapping CodeGeneratorAgent', { props });
+            const agentProps = props as AgentBootstrapProps;
+            const behaviorType = agentProps?.behaviorType ?? this.state.behaviorType ?? 'phasic';
+            const projectType = agentProps?.projectType ?? this.state.projectType ?? 'app';
+
+            if (behaviorType === 'phasic') {
+                this.behavior = new PhasicCodingBehavior(this as AgentInfrastructure<PhasicState>, projectType);
+            } else {
+                this.behavior = new AgenticCodingBehavior(this as AgentInfrastructure<AgenticState>, projectType);
+            }
+            
+            // Create objective based on project type
+            this.objective = this.createObjective(projectType);
+
+            this.behavior.onStart(props);
+
+            // Ignore if agent not initialized
+            if (!this.state.query) {
+                this.logger().warn(`Agent ${this.getAgentId()} session: ${this.state.sessionId} onStart ignored, agent not initialized`);
+                return;
+            }
+
+            // Ensure state is migrated for any previous versions
+            this.behavior.migrateStateIfNeeded();
+            
+            // Check if this is a read-only operation
+            const readOnlyMode = props?.readOnlyMode === true;
+            
+            if (readOnlyMode) {
+                this.logger().info(`Agent ${this.getAgentId()} starting in READ-ONLY mode - skipping expensive initialization`);
+                return;
+            }
+            
+            // Just in case
+            await this.gitInit();
+            
+            await this.behavior.ensureTemplateDetails();
+            this.logger().info(`Agent ${this.getAgentId()} session: ${this.state.sessionId} onStart processed successfully`);
+
+            // Load the latest user configs
+            try {
+                const modelConfigService = new ModelConfigService(this.env);
+                const userConfigsRecord = await modelConfigService.getUserModelConfigs(this.state.metadata.userId);
+                this.behavior.setUserModelConfigs(userConfigsRecord);
+                this.logger().info(`Agent ${this.getAgentId()} session: ${this.state.sessionId} onStart: User configs loaded successfully`, {userConfigsRecord});
+            } catch (configError) {
+                this.logger().warn("Failed to load user model configs, using defaults", configError);
+            }
+        } catch (error) {
+            this.logger().error("Fatal error in onStart", error);
+            // Don't rethrow, let the agent stay alive so we can debug via WS
         }
-
-        this.logger().info(`Agent ${this.getAgentId()} session: ${this.state.sessionId} onStart`, { props });
-
-        this.logger().info('Bootstrapping CodeGeneratorAgent', { props });
-        const agentProps = props as AgentBootstrapProps;
-        const behaviorType = agentProps?.behaviorType ?? this.state.behaviorType ?? 'phasic';
-        const projectType = agentProps?.projectType ?? this.state.projectType ?? 'app';
-
-        if (behaviorType === 'phasic') {
-            this.behavior = new PhasicCodingBehavior(this as AgentInfrastructure<PhasicState>, projectType);
-        } else {
-            this.behavior = new AgenticCodingBehavior(this as AgentInfrastructure<AgenticState>, projectType);
-        }
-        
-        // Create objective based on project type
-        this.objective = this.createObjective(projectType);
-
-        this.behavior.onStart(props);
-
-        // Ignore if agent not initialized
-        if (!this.state.query) {
-            this.logger().warn(`Agent ${this.getAgentId()} session: ${this.state.sessionId} onStart ignored, agent not initialized`);
-            return;
-        }
-
-        // Ensure state is migrated for any previous versions
-        this.behavior.migrateStateIfNeeded();
-        
-        // Check if this is a read-only operation
-        const readOnlyMode = props?.readOnlyMode === true;
-        
-        if (readOnlyMode) {
-            this.logger().info(`Agent ${this.getAgentId()} starting in READ-ONLY mode - skipping expensive initialization`);
-            return;
-        }
-        
-        // Just in case
-        await this.gitInit();
-        
-        await this.behavior.ensureTemplateDetails();
-        this.logger().info(`Agent ${this.getAgentId()} session: ${this.state.sessionId} onStart processed successfully`);
-
-        // Load the latest user configs
-        const modelConfigService = new ModelConfigService(this.env);
-        const userConfigsRecord = await modelConfigService.getUserModelConfigs(this.state.metadata.userId);
-        this.behavior.setUserModelConfigs(userConfigsRecord);
-        this.logger().info(`Agent ${this.getAgentId()} session: ${this.state.sessionId} onStart: User configs loaded successfully`, {userConfigsRecord});
     }
     
     onConnect(connection: Connection, ctx: ConnectionContext) {
         this.logger().info(`Agent connected for agent ${this.getAgentId()}`, { connection, ctx });
         let previewUrl = '';
         try {
-            if (this.behavior.getTemplateDetails().renderMode === 'browser') {
+            if (this.behavior && this.behavior.getTemplateDetails() && this.behavior.getTemplateDetails().renderMode === 'browser') {
                 previewUrl = this.behavior.getBrowserPreviewURL();
             }
         } catch (error) {
@@ -215,7 +233,7 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
         }
         sendToConnection(connection, WebSocketMessageResponses.AGENT_CONNECTED, {
             state: this.state,
-            templateDetails: this.behavior.getTemplateDetails(),
+            templateDetails: this.behavior?.getTemplateDetails?.() || null,
             previewUrl: previewUrl
         });
     }
@@ -241,13 +259,16 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
 
     logger(): StructuredLogger {
         if (!this._logger) {
-            this._logger = this.initLogger(this.getAgentId(), this.state.metadata.userId, this.state.sessionId);
+            // Fallback logger if state isn't ready
+            const agentId = this.state.metadata?.agentId || 'unknown_agent';
+            const userId = this.state.metadata?.userId || 'unknown_user';
+            this._logger = this.initLogger(agentId, userId, this.state.sessionId);
         }
         return this._logger;
     }
 
     getAgentId() {
-        return this.state.metadata.agentId;
+        return this.state.metadata?.agentId;
     }
     
     getWebSockets(): WebSocket[] {
@@ -307,10 +328,20 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
     }
 
     async getFullState(): Promise<AgentState> {
+        if (!this.behavior) return this.state;
         return await this.behavior.getFullState();
     }
 
     async getSummary(): Promise<AgentSummary> {
+        if (!this.behavior) {
+            return {
+                agentId: this.getAgentId(),
+                title: 'Initializing...',
+                description: 'Please wait',
+                status: 'creating',
+                updatedAt: new Date().toISOString()
+            };
+        }
         return this.behavior.getSummary();
     }
 
@@ -346,65 +377,51 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
     protected async saveToDatabase() {
         this.logger().info(`Saving agent ${this.getAgentId()} to database`);
         // Save the app to database (authenticated users only)
-        const appService = new AppService(this.env);
-        await appService.createApp({
-            id: this.state.metadata.agentId,
-            userId: this.state.metadata.userId,
-            sessionToken: null,
-            title: this.state.blueprint.title || this.state.query.substring(0, 100),
-            description: this.state.blueprint.description,
-            originalPrompt: this.state.query,
-            finalPrompt: this.state.query,
-            framework: this.state.blueprint.frameworks.join(','),
-            visibility: 'private',
-            status: 'generating',
+        try {
+            const appService = new AppService(this.env);
+            await appService.createApp({
+                id: this.state.metadata.agentId,
+                userId: this.state.metadata.userId,
+                sessionToken: null,
+                title: this.state.blueprint?.title || this.state.query?.substring(0, 100) || 'Untitled App',
+                description: this.state.blueprint?.description || '',
+                originalPrompt: this.state.query || '',
+                finalPrompt: this.state.query || '',
+                framework: this.state.blueprint?.frameworks?.join(',') || 'react',
+                visibility: 'private',
+                status: 'generating',
                 createdAt: new Date(),
-            updatedAt: new Date()
-            });
-        this.logger().info(`App saved successfully to database for agent ${this.state.metadata.agentId}`, { 
-            agentId: this.state.metadata.agentId, 
-            userId: this.state.metadata.userId,
-            visibility: 'private'
-        });
-        this.logger().info(`Agent initialized successfully for agent ${this.state.metadata.agentId}`);
+                updatedAt: new Date()
+                });
+            this.logger().info(`App saved successfully to database for agent ${this.state.metadata.agentId}`);
+        } catch (error) {
+            this.logger().error(`Failed to save app to database`, error);
+            // Don't throw here, as we still want the agent to work in memory
+        }
     }
 
     // ==========================================
     // Conversation Management
     // ==========================================
 
-    /*
-    * Each DO has 10 gb of sqlite storage. However, the way agents sdk works, it stores the 'state' object of the agent as a single row
-    * in the cf_agents_state table. And row size has a much smaller limit in sqlite. Thus, we only keep current compactified conversation
-    * in the agent's core state and store the full conversation in a separate DO table.
-    */
     getConversationState(id: string = DEFAULT_CONVERSATION_SESSION_ID): ConversationState {
-        const rows = this.sql<{ messages: string, id: string }>`SELECT * FROM full_conversations WHERE id = ${id}`;
         let fullHistory: ConversationMessage[] = [];
-        if (rows.length > 0 && rows[0].messages) {
-            try {
-                const parsed = JSON.parse(rows[0].messages);
-                if (Array.isArray(parsed)) {
-                    fullHistory = parsed as ConversationMessage[];
-                }
-            } catch (_e) {
-                this.logger().warn('Failed to parse full conversation history', _e);
-            }
-        }
-        
-        // Load compact (running) history from sqlite with fallback to in-memory state for migration
-        const compactRows = this.sql<{ messages: string, id: string }>`SELECT * FROM compact_conversations WHERE id = ${id}`;
         let runningHistory: ConversationMessage[] = [];
-        if (compactRows.length > 0 && compactRows[0].messages) {
-            try {
-                const parsed = JSON.parse(compactRows[0].messages);
-                if (Array.isArray(parsed)) {
-                    runningHistory = parsed as ConversationMessage[];
-                }
-            } catch (_e) {
-                this.logger().warn('Failed to parse compact conversation history', _e);
+
+        try {
+            const rows = this.sql<{ messages: string, id: string }>`SELECT * FROM full_conversations WHERE id = ${id}`;
+            if (rows.length > 0 && rows[0].messages) {
+                fullHistory = JSON.parse(rows[0].messages) as ConversationMessage[];
             }
+            
+            const compactRows = this.sql<{ messages: string, id: string }>`SELECT * FROM compact_conversations WHERE id = ${id}`;
+            if (compactRows.length > 0 && compactRows[0].messages) {
+                runningHistory = JSON.parse(compactRows[0].messages) as ConversationMessage[];
+            }
+        } catch (e) {
+            this.logger().warn('Failed to load conversation history from SQL', e);
         }
+
         if (runningHistory.length === 0) {
             runningHistory = fullHistory;
         }
@@ -414,9 +431,7 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
             const seen = new Set<string>();
             return messages.filter(msg => {
                 const key = `${msg.conversationId}-${msg.role}-${msg.tool_call_id || ''}`;
-                if (seen.has(key)) {
-                    return false;
-                }
+                if (seen.has(key)) return false;
                 seen.add(key);
                 return true;
             });
@@ -424,21 +439,15 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
 
         runningHistory = deduplicateMessages(runningHistory);
         fullHistory = deduplicateMessages(fullHistory);
-
-        this.logger().info(`Loaded conversation state ${id}, full_length: ${fullHistory.length}, compact_length: ${runningHistory.length}`, fullHistory);
         
-        return {
-            id: id,
-            runningHistory,
-            fullHistory,
-        };
+        return { id: id, runningHistory, fullHistory };
     }
 
     setConversationState(conversations: ConversationState) {
         const serializedFull = JSON.stringify(conversations.fullHistory);
         const serializedCompact = JSON.stringify(conversations.runningHistory);
         try {
-            this.logger().info(`Saving conversation state ${conversations.id}, full_length: ${serializedFull.length}, compact_length: ${serializedCompact.length}`, serializedFull);
+            this.logger().info(`Saving conversation state ${conversations.id}`);
             void this.sql`INSERT OR REPLACE INTO compact_conversations (id, messages) VALUES (${conversations.id}, ${serializedCompact})`;
             void this.sql`INSERT OR REPLACE INTO full_conversations (id, messages) VALUES (${conversations.id}, ${serializedFull})`;
         } catch (error) {
@@ -448,47 +457,28 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
 
     addConversationMessage(message: ConversationMessage) {
         const conversationState = this.getConversationState();
-        if (!conversationState.runningHistory.find(msg => msg.conversationId === message.conversationId)) {
-            this.logger().info('Adding conversation message', {
-                message,
-                conversationId: message.conversationId,
-                runningHistoryLength: conversationState.runningHistory.length,
-                fullHistoryLength: conversationState.fullHistory.length
-            });
-            conversationState.runningHistory.push(message);
-        } else  {
-            conversationState.runningHistory = conversationState.runningHistory.map(msg => {
-                if (msg.conversationId === message.conversationId) {
-                    return message;
-                }
-                return msg;
-            });
-        }
-        if (!conversationState.fullHistory.find(msg => msg.conversationId === message.conversationId)) {
-            conversationState.fullHistory.push(message);
-        } else {
-            conversationState.fullHistory = conversationState.fullHistory.map(msg => {
-                if (msg.conversationId === message.conversationId) {
-                    return message;
-                }
-                return msg;
-            });
-        }
+        
+        const updateHistory = (history: ConversationMessage[]) => {
+            const index = history.findIndex(msg => msg.conversationId === message.conversationId);
+            if (index !== -1) {
+                history[index] = message;
+            } else {
+                history.push(message);
+            }
+            return history;
+        };
+
+        conversationState.runningHistory = updateHistory(conversationState.runningHistory);
+        conversationState.fullHistory = updateHistory(conversationState.fullHistory);
+        
         this.setConversationState(conversationState);
     }
     
-    /**
-     * Clear conversation history
-     */
     public clearConversation(): void {
         try {
             this.logger().info('Clearing conversation history');
-            
-            // Clear SQL tables for default conversation session
             void this.sql`DELETE FROM full_conversations WHERE id = ${DEFAULT_CONVERSATION_SESSION_ID}`;
             void this.sql`DELETE FROM compact_conversations WHERE id = ${DEFAULT_CONVERSATION_SESSION_ID}`;
-            
-            this.logger().info('Conversation history cleared successfully');
             
             this.broadcast(WebSocketMessageResponses.CONVERSATION_CLEARED, {
                 message: 'Conversation history cleared',
@@ -499,22 +489,16 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
         }
     }
 
-    /**
-     * Handle user input during conversational code generation
-     * Processes user messages and updates pendingUserInputs state
-     */
     async handleUserInput(userMessage: string, images?: ImageAttachment[]): Promise<void> {
         try {
-            this.logger().info('Processing user input message', { 
-                messageLength: userMessage.length,
-                pendingInputsCount: this.state.pendingUserInputs.length,
-                hasImages: !!images && images.length > 0,
-                imageCount: images?.length || 0
-            });
+            this.logger().info('Processing user input message');
+            if (!this.behavior) {
+                throw new Error("Agent behavior not initialized");
+            }
 
             await this.behavior.handleUserInput(userMessage, images);
+            
             if (!this.behavior.isCodeGenerating()) {
-                // If idle, start generation process
                 this.logger().info('User input during IDLE state, starting generation');
                 this.behavior.generateAllFiles().catch(error => {
                     this.logger().error('Error starting generation from user input:', error);
@@ -523,38 +507,21 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
 
         } catch (error) {
             if (error instanceof RateLimitExceededError) {
-                this.logger().error('Rate limit exceeded:', error);
-                this.broadcast(WebSocketMessageResponses.RATE_LIMIT_ERROR, {
-                    error
-                });
+                this.broadcast(WebSocketMessageResponses.RATE_LIMIT_ERROR, { error });
                 return;
             }
             this.broadcastError('Error processing user input', error);
         }
     }
-    // ==========================================
-    // WebSocket Management
-    // ==========================================
-    
-    /**
-     * Handle WebSocket message - Agent owns WebSocket lifecycle
-     * Delegates to centralized handler which can access both behavior and objective
-     */
+
     async onMessage(connection: Connection, message: string): Promise<void> {
         handleWebSocketMessage(this, connection, message);
     }
     
-    /**
-     * Handle WebSocket close - Agent owns WebSocket lifecycle
-     */
     async onClose(connection: Connection): Promise<void> {
         handleWebSocketClose(this, connection);
     }
     
-    /**
-     * Broadcast message to all connected WebSocket clients
-     * Type-safe version using proper WebSocket message types
-     */
     public broadcast<T extends WebSocketMessageType>(
         type: T, 
         data?: WebSocketMessageData<T>
@@ -569,37 +536,23 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
             error: `${context}: ${errorMessage}`
         });
     }
-    // ==========================================
-    // Git Management
-    // ==========================================
 
     protected async gitInit() {
         try {
             await this.git.init();
-            this.logger().info("Git initialized successfully");
-            // Check if there is any commit
             const head = await this.git.getHead();
             
             if (!head) {
-                this.logger().info("No commits found, creating initial commit");
-                // get all generated files and commit them
                 const generatedFiles = this.fileManager.getGeneratedFiles();
-                if (generatedFiles.length === 0) {
-                    this.logger().info("No generated files found, skipping initial commit");
-                    return;
+                if (generatedFiles.length > 0) {
+                    await this.git.commit(generatedFiles, "Initial commit");
                 }
-                await this.git.commit(generatedFiles, "Initial commit");
-                this.logger().info("Initial commit created successfully");
             }
         } catch (error) {
             this.logger().error("Error during git init:", error);
         }
     }
 
-    /**
-     * Export git objects
-     * The route handler will build the repo with template rebasing
-     */
     async exportGitObjects(): Promise<{
         gitObjects: Array<{ path: string; data: Uint8Array }>;
         query: string;
@@ -607,15 +560,14 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
         templateDetails: TemplateDetails | null;
     }> {
         try {
-            // Export git objects efficiently (minimal DO memory usage)
             const gitObjects = this.git.fs.exportGitObjects();
-
             await this.gitInit();
             
-            // Ensure template details are available
-            await this.behavior.ensureTemplateDetails();
+            if (this.behavior) {
+                await this.behavior.ensureTemplateDetails();
+            }
 
-            const templateDetails = this.behavior.getTemplateDetails();
+            const templateDetails = this.behavior?.getTemplateDetails() || null;
             
             return {
                 gitObjects,
@@ -629,19 +581,9 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
         }
     }
 
-    /**
-     * Handle browser file serving requests
-     */
     async handleBrowserFileServing(request: Request): Promise<Response> {
         const url = new URL(request.url);
 
-        this.logger().info('[BROWSER SERVING] Request received', {
-            hostname: url.hostname,
-            pathname: url.pathname,
-            method: request.method
-        });
-
-        // Handle CORS preflight
         if (request.method === 'OPTIONS') {
             return new Response(null, {
                 status: 204,
@@ -654,94 +596,41 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
             });
         }
 
-        // Extract token from hostname
-        // Pattern: b-{agentid}-{token}.{previewDomain}/{filepath}
-        // Token is always 16 characters after the LAST hyphen (after removing 'b-' prefix)
         const subdomain = url.hostname.split('.')[0];
+        if (!subdomain.startsWith('b-')) return new Response('Invalid request', { status: 400 });
 
-        if (!subdomain.startsWith('b-')) {
-            this.logger().warn('[BROWSER SERVING] Invalid hostname pattern - missing b- prefix', { hostname: url.hostname });
-            return new Response('Invalid request', {
-                status: 400,
-                headers: { 'Content-Type': 'text/plain' }
-            });
-        }
-
-        const withoutPrefix = subdomain.substring(2); // Remove 'b-'
+        const withoutPrefix = subdomain.substring(2);
         const lastHyphenIndex = withoutPrefix.lastIndexOf('-');
-
-        if (lastHyphenIndex === -1) {
-            this.logger().warn('[BROWSER SERVING] Invalid hostname pattern - no hyphen after prefix', { hostname: url.hostname });
-            return new Response('Invalid request', {
-                status: 400,
-                headers: { 'Content-Type': 'text/plain' }
-            });
-        }
+        if (lastHyphenIndex === -1) return new Response('Invalid request', { status: 400 });
 
         const providedToken = withoutPrefix.substring(lastHyphenIndex + 1);
+        const filePath = url.pathname === '/' || url.pathname === '' ? 'public/index.html' : url.pathname.replace(/^\//, '');
 
-        // Extract file path from pathname
-        const filePath = url.pathname === '/' || url.pathname === ''
-            ? 'public/index.html'
-            : url.pathname.replace(/^\//, ''); // Remove leading slash
-
-        this.logger().info('[BROWSER SERVING] Extracted', { providedToken, filePath });
-
-        // Validate token
         const storedToken = this.state.fileServingToken?.token;
         if (!storedToken || providedToken !== storedToken.toLowerCase()) {
-            this.logger().warn('[BROWSER SERVING] Token mismatch', { providedToken, storedToken });
-            return new Response('Unauthorized', {
-                status: 403,
-                headers: { 'Content-Type': 'text/plain' }
-            });
+            return new Response('Unauthorized', { status: 403 });
         }
 
-        if (!isPathSafe(filePath)) {
-            return new Response('Invalid path', {
-                status: 400,
-                headers: { 'Content-Type': 'text/plain' }
-            });
-        }
+        if (!isPathSafe(filePath)) return new Response('Invalid path', { status: 400 });
+        
         const normalized = normalizePath(filePath);
         let file = this.fileManager.getFile(normalized);
-
-        // Try with public/ prefix if not found
         if (!file && !normalized.startsWith('public/')) {
             file = this.fileManager.getFile(`public/${normalized}`);
         }
 
-        if (!file) {
-            this.logger().warn('[BROWSER SERVING] File not found', { normalized });
-            return new Response('File not found', {
-                status: 404,
-                headers: { 'Content-Type': 'text/plain' }
-            });
-        }
+        if (!file) return new Response('File not found', { status: 404 });
 
-        // Serve file with correct Content-Type
         const contentType = getMimeType(normalized) || 'application/octet-stream';
-
-        this.logger().info('[BROWSER SERVING] Serving file', {
-            path: normalized,
-            contentType
-        });
-
         let content = file.fileContents;
 
-        // For HTML files, inject base tag
         if (normalized.endsWith('.html') || contentType.includes('text/html')) {
             const baseTag = `<base href="/">`;
-
-            // Inject base tag after <head> tag if present
             if (content.includes('<head>')) {
                 content = content.replace(/<head>/i, `<head>\n  ${baseTag}`);
             } else {
-                // Fallback: inject at the beginning
                 content = baseTag + '\n' + content;
             }
-
-            this.logger().info('[BROWSER SERVING] Injected base tag');
         }
 
         return new Response(content, {
@@ -750,31 +639,19 @@ export class CodeGeneratorAgent extends Agent<Env, AgentState> implements AgentI
                 'Content-Type': contentType,
                 'Cache-Control': 'no-cache, no-store, must-revalidate',
                 'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, OPTIONS',
-                'Access-Control-Allow-Headers': '*',
                 'X-Sandbox-Type': 'browser-native'
             }
         });
     }
 
-    /**
-     * Cache GitHub OAuth token in memory for subsequent exports
-     * Token is ephemeral - lost on DO eviction
-     */
     setGitHubToken(token: string, username: string, ttl: number = 3600000): void {
         this.objective.setGitHubToken(token, username, ttl);
     }
 
-    /**
-     * Get cached GitHub token if available and not expired
-     */
     getGitHubToken(): { token: string; username: string } | null {
         return this.objective.getGitHubToken();
     }
 
-    /**
-     * Clear cached GitHub token
-     */
     clearGitHubToken(): void {
         this.objective.clearGitHubToken();
     }
