@@ -8,7 +8,6 @@ import { createLogger } from '../../logger';
 
 const logger = createLogger('OAuthProvider');
 
-
 /**
  * OAuth tokens returned from providers
  */
@@ -32,7 +31,7 @@ export abstract class BaseOAuthProvider {
     constructor(
         protected clientId: string,
         protected clientSecret: string,
-        protected redirectUri: string
+        public readonly redirectUri: string
     ) {}
     
     /**
@@ -90,17 +89,12 @@ export abstract class BaseOAuthProvider {
             });
             
             if (!response.ok) {
-                const error = await response.text();
-                logger.error('Token exchange failed', { provider: this.provider, error });
-                throw new Error(`Token exchange failed: ${error}`);
+                const errorText = await response.text();
+                logger.error('Token exchange failed', { provider: this.provider, error: errorText });
+                throw new Error(`Token exchange failed: ${errorText}`);
             }
             
-            const data = await response.json() as {
-                access_token: string;
-                refresh_token?: string;
-                expires_in?: number;
-                token_type?: string;
-            };
+            const data = await response.json() as any;
             
             return {
                 accessToken: data.access_token,
@@ -141,21 +135,16 @@ export abstract class BaseOAuthProvider {
             });
             
             if (!response.ok) {
-                const error = await response.text();
-                logger.error('Token refresh failed', { provider: this.provider, error });
-                throw new Error(`Token refresh failed: ${error}`);
+                const errorText = await response.text();
+                logger.error('Token refresh failed', { provider: this.provider, error: errorText });
+                throw new Error(`Token refresh failed: ${errorText}`);
             }
             
-            const data = await response.json() as {
-                access_token: string;
-                refresh_token?: string;
-                expires_in?: number;
-                token_type?: string;
-            };
+            const data = await response.json() as any;
             
             return {
                 accessToken: data.access_token,
-                refreshToken: data.refresh_token || refreshToken, // Some providers don't return new refresh token
+                refreshToken: data.refresh_token || refreshToken,
                 expiresIn: data.expires_in,
                 tokenType: data.token_type || 'Bearer'
             };
@@ -169,16 +158,13 @@ export abstract class BaseOAuthProvider {
      * Generate PKCE code challenge
      */
     protected async generateCodeChallenge(verifier: string): Promise<string> {
-        // Generate SHA256 hash of the verifier
         const encoder = new TextEncoder();
         const data = encoder.encode(verifier);
         const hashBuffer = await crypto.subtle.digest('SHA-256', data);
         
-        // Convert to base64url
         const hashArray = new Uint8Array(hashBuffer);
         const base64String = btoa(String.fromCharCode(...hashArray));
         
-        // Convert to base64url format
         return base64String
             .replace(/\+/g, '-')
             .replace(/\//g, '_')
